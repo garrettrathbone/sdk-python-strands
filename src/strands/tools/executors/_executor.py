@@ -18,6 +18,7 @@ from ...telemetry.metrics import Trace
 from ...telemetry.tracer import get_tracer, serialize
 from ...types._events import ToolCancelEvent, ToolInterruptEvent, ToolResultEvent, ToolStreamEvent, TypedEvent
 from ...types.content import Message
+from ...types.exceptions import AgentDelegationException
 from ...types.interrupt import Interrupt
 from ...types.tools import ToolChoice, ToolChoiceAuto, ToolConfig, ToolResult, ToolUse
 from ..structured_output._structured_output_context import StructuredOutputContext
@@ -120,6 +121,7 @@ class ToolExecutor(abc.ABC):
         Yields:
             Tool events with the last being the tool result.
         """
+        logger.debug("Tool executor _stream called for tool %s", tool_use.get("name"))
         logger.debug("tool_use=<%s> | streaming", tool_use)
         tool_name = tool_use["name"]
         structured_output_context = structured_output_context or StructuredOutputContext()
@@ -251,16 +253,26 @@ class ToolExecutor(abc.ABC):
                 tool_results.append(after_event.result)
                 return
 
-            except Exception as e:
-                logger.exception("tool_name=<%s> | failed to process tool", tool_name)
-                error_result: ToolResult = {
-                    "toolUseId": str(tool_use.get("toolUseId")),
-                    "status": "error",
-                    "content": [{"text": f"Error: {str(e)}"}],
-                }
-
-                after_event, _ = await ToolExecutor._invoke_after_tool_call_hook(
-                    agent, selected_tool, tool_use, invocation_state, error_result, exception=e
+        except AgentDelegationException as e:
+            # Re-raise immediately - don't treat as tool execution error
+            logger.debug("Tool executor caught AgentDelegationException for %s, re-raising", e.target_agent)
+            raise
+        except Exception as e:
+            logger.debug("Tool executor caught generic exception for %s: %s: %s", tool_name, type(e).__name__, e)
+            logger.exception("tool_name=<%s> | failed to process tool", tool_name)
+            error_result: ToolResult = {
+                "toolUseId": str(tool_use.get("toolUseId")),
+                "status": "error",
+                "content": [{"text": f"Tool execution failed: {str(e)}"}],
+            }
+            after_event = agent.hooks.invoke_callbacks(
+                AfterToolCallEvent(
+                    agent=agent,
+                    selected_tool=selected_tool,
+                    tool_use=tool_use,
+                    invocation_state=invocation_state,
+                    result=error_result,
+                    exception=e,
                 )
                 # Check if retry requested (getattr for BidiAfterToolCallEvent compatibility)
                 if getattr(after_event, "retry", False):
@@ -296,6 +308,8 @@ class ToolExecutor(abc.ABC):
         Yields:
             Tool events with the last being the tool result.
         """
+        from ...types.exceptions import AgentDelegationException
+
         tool_name = tool_use["name"]
         structured_output_context = structured_output_context or StructuredOutputContext()
 
@@ -307,27 +321,32 @@ class ToolExecutor(abc.ABC):
         tool_trace = Trace(f"Tool: {tool_name}", parent_id=cycle_trace.id, raw_name=tool_name)
         tool_start_time = time.time()
 
-        with trace_api.use_span(tool_call_span):
-            async for event in ToolExecutor._stream(
-                agent, tool_use, tool_results, invocation_state, structured_output_context, **kwargs
-            ):
-                yield event
+        # Handle delegation exceptions outside of tracing context to avoid swallowing
+        try:
+            with trace_api.use_span(tool_call_span):
+                async for event in ToolExecutor._stream(agent, tool_use, tool_results, invocation_state, **kwargs):
+                    yield event
 
-            if isinstance(event, ToolInterruptEvent):
-                tracer.end_tool_call_span(tool_call_span, tool_result=None)
-                return
+                if isinstance(event, ToolInterruptEvent):
+                    tracer.end_tool_call_span(tool_call_span, tool_result=None)
+                    return
 
-            result_event = cast(ToolResultEvent, event)
-            result = result_event.tool_result
 
-            tool_success = result.get("status") == "success"
-            tool_duration = time.time() - tool_start_time
-            message = Message(role="user", content=[{"toolResult": result}])
-            if ToolExecutor._is_agent(agent):
+                result_event = cast(ToolResultEvent, event)
+                result = result_event.tool_result
+
+                tool_success = result.get("status") == "success"
+                tool_duration = time.time() - tool_start_time
+                message = Message(role="user", content=[{"toolResult": result}])
                 agent.event_loop_metrics.add_tool_usage(tool_use, tool_duration, tool_trace, tool_success, message)
-            cycle_trace.add_child(tool_trace)
+                cycle_trace.add_child(tool_trace)
 
-            tracer.end_tool_call_span(tool_call_span, result)
+                tracer.end_tool_call_span(tool_call_span, result)
+        except AgentDelegationException as e:
+            logger.debug("_stream_with_trace caught AgentDelegationException for %s, re-raising", e.target_agent)
+            # End span with delegation information before re-raising
+            tracer.end_tool_call_span(tool_call_span, {"status": "delegated", "target_agent": e.target_agent})
+            raise
 
     @abc.abstractmethod
     # pragma: no cover

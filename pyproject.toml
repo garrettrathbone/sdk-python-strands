@@ -241,6 +241,9 @@ convention = "google"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "delegation: marks tests that cover delegation-specific behaviors",
+]
 addopts = "--ignore=tests/strands/experimental/bidi --ignore=tests_integ/bidi --junit-xml=build/test-results.xml"
 timeout = 90
 

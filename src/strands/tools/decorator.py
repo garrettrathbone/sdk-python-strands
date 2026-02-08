@@ -65,6 +65,7 @@ from typing_extensions import override
 
 from ..interrupt import InterruptException
 from ..types._events import ToolInterruptEvent, ToolResultEvent, ToolStreamEvent
+from ..types.exceptions import AgentDelegationException
 from ..types.tools import AgentTool, JSONSchema, ToolContext, ToolGenerator, ToolResult, ToolSpec, ToolUse
 
 logger = logging.getLogger(__name__)
@@ -606,10 +607,12 @@ class DecoratedFunctionTool(AgentTool, Generic[P, R]):
                 result = await asyncio.to_thread(self._tool_func, **validated_input)  # type: ignore
                 yield self._wrap_tool_result(tool_use_id, result)
 
+        except AgentDelegationException:
+            # Re-raise delegation exceptions immediately - don't treat as tool errors
+            raise
         except InterruptException as e:
             yield ToolInterruptEvent(tool_use, [e.interrupt])
             return
-
         except ValueError as e:
             # Special handling for validation errors
             error_msg = str(e)
