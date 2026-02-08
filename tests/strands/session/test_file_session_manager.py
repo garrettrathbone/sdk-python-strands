@@ -3,7 +3,7 @@
 import json
 import os
 import tempfile
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -53,6 +53,22 @@ def sample_message():
     )
 
 
+@pytest.fixture
+def mock_multi_agent():
+    """Create mock multi-agent for testing."""
+    mock = Mock()
+    mock.id = "test-multi-agent"
+    mock.state = {"key": "value"}
+    mock.serialize_state.return_value = {"id": "test-multi-agent", "state": {"key": "value"}}
+    return mock
+
+
+@pytest.fixture
+def multi_agent_manager(temp_dir):
+    """Create FileSessionManager."""
+    return FileSessionManager(session_id="test", storage_dir=temp_dir)
+
+
 def test_create_session(file_manager, sample_session):
     """Test creating a session."""
     file_manager.create_session(sample_session)
@@ -66,7 +82,7 @@ def test_create_session(file_manager, sample_session):
     assert os.path.exists(session_file)
 
     # Verify content
-    with open(session_file, "r") as f:
+    with open(session_file) as f:
         data = json.load(f)
         assert data["session_id"] == sample_session.session_id
         assert data["session_type"] == sample_session.session_type
@@ -128,7 +144,7 @@ def test_create_agent(file_manager, sample_session, sample_agent):
     assert os.path.exists(agent_file)
 
     # Verify content
-    with open(agent_file, "r") as f:
+    with open(agent_file) as f:
         data = json.load(f)
         assert data["agent_id"] == sample_agent.agent_id
         assert data["state"] == sample_agent.state
@@ -194,7 +210,7 @@ def test_create_message(file_manager, sample_session, sample_agent, sample_messa
     assert os.path.exists(message_path)
 
     # Verify content
-    with open(message_path, "r") as f:
+    with open(message_path) as f:
         data = json.load(f)
         assert data["message_id"] == sample_message.message_id
 
@@ -408,3 +424,80 @@ def test__get_message_path_invalid_message_id(message_id, file_manager):
     """Test that message_id that is not an integer raises ValueError."""
     with pytest.raises(ValueError, match=r"message_id=<.*> \| message id must be an integer"):
         file_manager._get_message_path("session1", "agent1", message_id)
+
+
+def test_create_multi_agent(multi_agent_manager, sample_session, mock_multi_agent):
+    """Test creating multi-agent state."""
+    multi_agent_manager.create_session(sample_session)
+    multi_agent_manager.create_multi_agent(sample_session.session_id, mock_multi_agent)
+
+    # Verify file created
+    multi_agent_file = os.path.join(
+        multi_agent_manager._get_multi_agent_path(sample_session.session_id, mock_multi_agent.id),
+        "multi_agent.json",
+    )
+    assert os.path.exists(multi_agent_file)
+
+    # Verify content
+    with open(multi_agent_file) as f:
+        data = json.load(f)
+        assert data["id"] == mock_multi_agent.id
+        assert data["state"] == mock_multi_agent.state
+
+
+def test_read_multi_agent(multi_agent_manager, sample_session, mock_multi_agent):
+    """Test reading multi-agent state."""
+    # Create session and multi-agent
+    multi_agent_manager.create_session(sample_session)
+    multi_agent_manager.create_multi_agent(sample_session.session_id, mock_multi_agent)
+
+    # Read multi-agent
+    result = multi_agent_manager.read_multi_agent(sample_session.session_id, mock_multi_agent.id)
+
+    assert result["id"] == mock_multi_agent.id
+    assert result["state"] == mock_multi_agent.state
+
+
+def test_read_nonexistent_multi_agent(multi_agent_manager, sample_session):
+    """Test reading multi-agent state that doesn't exist."""
+    result = multi_agent_manager.read_multi_agent(sample_session.session_id, "nonexistent")
+    assert result is None
+
+
+def test_update_multi_agent(multi_agent_manager, sample_session, mock_multi_agent):
+    """Test updating multi-agent state."""
+    # Create session and multi-agent
+    multi_agent_manager.create_session(sample_session)
+    multi_agent_manager.create_multi_agent(sample_session.session_id, mock_multi_agent)
+
+    updated_mock = Mock()
+    updated_mock.id = mock_multi_agent.id
+    updated_mock.serialize_state.return_value = {"id": mock_multi_agent.id, "state": {"updated": "value"}}
+    multi_agent_manager.update_multi_agent(sample_session.session_id, updated_mock)
+
+    # Verify update
+    result = multi_agent_manager.read_multi_agent(sample_session.session_id, mock_multi_agent.id)
+    assert result["state"] == {"updated": "value"}
+
+
+def test_update_nonexistent_multi_agent(multi_agent_manager, sample_session):
+    """Test updating multi-agent state that doesn't exist."""
+    # Create session
+    multi_agent_manager.create_session(sample_session)
+
+    nonexistent_mock = Mock()
+    nonexistent_mock.id = "nonexistent"
+    with pytest.raises(SessionException):
+        multi_agent_manager.update_multi_agent(sample_session.session_id, nonexistent_mock)
+
+
+def test_create_session_multi_agent_directory_structure(multi_agent_manager, sample_session):
+    """Test multi-agent session creates correct directory structure."""
+    multi_agent_manager.create_session(sample_session)
+
+    # Verify directory structure
+    session_dir = multi_agent_manager._get_session_path(sample_session.session_id)
+    multi_agents_dir = os.path.join(session_dir, "multi_agents")
+
+    assert os.path.exists(session_dir)
+    assert os.path.exists(multi_agents_dir)

@@ -2,7 +2,7 @@
 
 import json
 import unittest.mock
-from typing import Any, Dict, List
+from typing import Any
 
 import boto3
 import pytest
@@ -32,7 +32,7 @@ def sagemaker_client(boto_session):
 
 
 @pytest.fixture
-def endpoint_config() -> Dict[str, Any]:
+def endpoint_config() -> dict[str, Any]:
     """Default endpoint configuration for tests."""
     return {
         "endpoint_name": "test-endpoint",
@@ -42,7 +42,7 @@ def endpoint_config() -> Dict[str, Any]:
 
 
 @pytest.fixture
-def payload_config() -> Dict[str, Any]:
+def payload_config() -> dict[str, Any]:
     """Default payload configuration for tests."""
     return {
         "max_tokens": 1024,
@@ -64,7 +64,7 @@ def messages() -> Messages:
 
 
 @pytest.fixture
-def tool_specs() -> List[ToolSpec]:
+def tool_specs() -> list[ToolSpec]:
     """Sample tool specifications for testing."""
     return [
         {
@@ -112,11 +112,13 @@ class TestSageMakerAIModel:
             "endpoint_name": "test-endpoint",
             "inference_component_name": "test-component",
             "region_name": "us-west-2",
+            "additional_args": {"test_req_arg_name": "test_req_arg_value"},
         }
         payload_config = {
             "stream": False,
             "max_tokens": 1024,
             "temperature": 0.7,
+            "additional_args": {"test_payload_arg_name": "test_payload_arg_value"},
         }
         client_config = BotocoreConfig(user_agent_extra="test-agent")
 
@@ -129,9 +131,11 @@ class TestSageMakerAIModel:
 
         assert model.endpoint_config["endpoint_name"] == "test-endpoint"
         assert model.endpoint_config["inference_component_name"] == "test-component"
+        assert model.endpoint_config["additional_args"]["test_req_arg_name"] == "test_req_arg_value"
         assert model.payload_config["stream"] is False
         assert model.payload_config["max_tokens"] == 1024
         assert model.payload_config["temperature"] == 0.7
+        assert model.payload_config["additional_args"]["test_payload_arg_name"] == "test_payload_arg_value"
 
         boto_session.client.assert_called_once_with(
             service_name="sagemaker-runtime",
@@ -238,6 +242,30 @@ class TestSageMakerAIModel:
     #     payload = json.loads(request["Body"])
     #     assert "tools" in payload
     #     assert payload["tools"] == []
+
+    def test_format_request_with_additional_args(self, boto_session, endpoint_config, messages, payload_config):
+        """Test formatting a request's `additional_args` where provided"""
+        endpoint_config_ext = {
+            **endpoint_config,
+            "additional_args": {
+                "extra_request_key": "extra_request_value",
+            },
+        }
+        payload_config_ext = {
+            **payload_config,
+            "additional_args": {
+                "extra_payload_key": "extra_payload_value",
+            },
+        }
+        model = SageMakerAIModel(
+            boto_session=boto_session,
+            endpoint_config=endpoint_config_ext,
+            payload_config=payload_config_ext,
+        )
+        request = model.format_request(messages)
+        assert request.get("extra_request_key") == "extra_request_value"
+        payload = json.loads(request["Body"])
+        assert payload.get("extra_payload_key") == "extra_payload_value"
 
     @pytest.mark.asyncio
     async def test_stream_with_streaming_enabled(self, sagemaker_client, model, messages):
@@ -377,8 +405,8 @@ class TestSageMakerAIModel:
         # Mock the response from SageMaker with split JSON
         mock_response = {
             "Body": [
-                {"PayloadPart": {"Bytes": '{"choices": [{"delta": {"content": "Paris is'.encode("utf-8")}},
-                {"PayloadPart": {"Bytes": ' the capital of France."}, "finish_reason": "stop"}]}'.encode("utf-8")}},
+                {"PayloadPart": {"Bytes": b'{"choices": [{"delta": {"content": "Paris is'}},
+                {"PayloadPart": {"Bytes": b' the capital of France."}, "finish_reason": "stop"}]}'}},
             ]
         }
         sagemaker_client.invoke_endpoint_with_response_stream.return_value = mock_response
@@ -416,8 +444,8 @@ class TestSageMakerAIModel:
         # Mock the response from SageMaker with split JSON
         mock_response = {
             "Body": [
-                {"PayloadPart": {"Bytes": '{"choices": [{"delta": {"content": "Paris is'.encode("utf-8")}},
-                {"PayloadPart": {"Bytes": ' the capital of France."}, "finish_reason": "stop"}]}'.encode("utf-8")}},
+                {"PayloadPart": {"Bytes": b'{"choices": [{"delta": {"content": "Paris is'}},
+                {"PayloadPart": {"Bytes": b' the capital of France."}, "finish_reason": "stop"}]}'}},
             ]
         }
         sagemaker_client.invoke_endpoint_with_response_stream.return_value = mock_response

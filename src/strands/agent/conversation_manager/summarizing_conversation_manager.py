@@ -1,12 +1,15 @@
 """Summarizing conversation history management with configurable options."""
 
 import logging
-from typing import TYPE_CHECKING, Any, List, Optional, cast
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 from typing_extensions import override
 
+from ...tools._tool_helpers import noop_tool
+from ...tools.registry import ToolRegistry
 from ...types.content import Message
 from ...types.exceptions import ContextWindowOverflowException
+from ...types.tools import AgentTool
 from .conversation_manager import ConversationManager
 
 if TYPE_CHECKING:
@@ -23,6 +26,10 @@ Format Requirements:
 - You MUST create a structured and concise summary in bullet-point format.
 - You MUST NOT respond conversationally.
 - You MUST NOT address the user directly.
+- You MUST NOT comment on tool availability.
+
+Assumptions:
+- You MUST NOT assume tool executions failed unless otherwise stated.
 
 Task:
 Your task is to create a structured summary document:
@@ -55,7 +62,7 @@ class SummarizingConversationManager(ConversationManager):
         summary_ratio: float = 0.3,
         preserve_recent_messages: int = 10,
         summarization_agent: Optional["Agent"] = None,
-        summarization_system_prompt: Optional[str] = None,
+        summarization_system_prompt: str | None = None,
     ):
         """Initialize the summarizing conversation manager.
 
@@ -80,10 +87,10 @@ class SummarizingConversationManager(ConversationManager):
         self.preserve_recent_messages = preserve_recent_messages
         self.summarization_agent = summarization_agent
         self.summarization_system_prompt = summarization_system_prompt
-        self._summary_message: Optional[Message] = None
+        self._summary_message: Message | None = None
 
     @override
-    def restore_from_session(self, state: dict[str, Any]) -> Optional[list[Message]]:
+    def restore_from_session(self, state: dict[str, Any]) -> list[Message] | None:
         """Restores the Summarizing Conversation manager from its previous state in a session.
 
         Args:
@@ -114,7 +121,7 @@ class SummarizingConversationManager(ConversationManager):
         # No proactive management - summarization only happens on context overflow
         pass
 
-    def reduce_context(self, agent: "Agent", e: Optional[Exception] = None, **kwargs: Any) -> None:
+    def reduce_context(self, agent: "Agent", e: Exception | None = None, **kwargs: Any) -> None:
         """Reduce context using summarization.
 
         Args:
@@ -166,7 +173,7 @@ class SummarizingConversationManager(ConversationManager):
             logger.error("Summarization failed: %s", summarization_error)
             raise summarization_error from e
 
-    def _generate_summary(self, messages: List[Message], agent: "Agent") -> Message:
+    def _generate_summary(self, messages: list[Message], agent: "Agent") -> Message:
         """Generate a summary of the provided messages.
 
         Args:
@@ -182,9 +189,10 @@ class SummarizingConversationManager(ConversationManager):
         # Choose which agent to use for summarization
         summarization_agent = self.summarization_agent if self.summarization_agent is not None else agent
 
-        # Save original system prompt and messages to restore later
+        # Save original system prompt, messages, and tool registry to restore later
         original_system_prompt = summarization_agent.system_prompt
         original_messages = summarization_agent.messages.copy()
+        original_tool_registry = summarization_agent.tool_registry
 
         try:
             # Only override system prompt if no agent was provided during initialization
@@ -197,6 +205,13 @@ class SummarizingConversationManager(ConversationManager):
                 )
                 # Temporarily set the system prompt for summarization
                 summarization_agent.system_prompt = system_prompt
+
+            # Add no-op tool if agent has no tools to satisfy tool spec requirement
+            if not summarization_agent.tool_names:
+                tool_registry = ToolRegistry()
+                tool_registry.register_tool(cast(AgentTool, noop_tool))
+                summarization_agent.tool_registry = tool_registry
+
             summarization_agent.messages = messages
 
             # Use the agent to generate summary with rich content (can use tools if needed)
@@ -207,8 +222,9 @@ class SummarizingConversationManager(ConversationManager):
             # Restore original agent state
             summarization_agent.system_prompt = original_system_prompt
             summarization_agent.messages = original_messages
+            summarization_agent.tool_registry = original_tool_registry
 
-    def _adjust_split_point_for_tool_pairs(self, messages: List[Message], split_point: int) -> int:
+    def _adjust_split_point_for_tool_pairs(self, messages: list[Message], split_point: int) -> int:
         """Adjust the split point to avoid breaking ToolUse/ToolResult pairs.
 
         Uses the same logic as SlidingWindowConversationManager for consistency.

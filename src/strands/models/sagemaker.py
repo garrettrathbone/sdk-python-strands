@@ -3,8 +3,9 @@
 import json
 import logging
 import os
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Literal, Optional, Type, TypedDict, TypeVar, Union, cast
+from typing import Any, Literal, TypedDict, TypeVar
 
 import boto3
 from botocore.config import Config as BotocoreConfig
@@ -37,7 +38,7 @@ class UsageMetadata:
     total_tokens: int
     completion_tokens: int
     prompt_tokens: int
-    prompt_tokens_details: Optional[int] = 0
+    prompt_tokens_details: int | None = 0
 
 
 @dataclass
@@ -49,8 +50,8 @@ class FunctionCall:
         arguments: Arguments to pass to the function
     """
 
-    name: Union[str, dict[Any, Any]]
-    arguments: Union[str, dict[Any, Any]]
+    name: str | dict[Any, Any]
+    arguments: str | dict[Any, Any]
 
     def __init__(self, **kwargs: dict[str, str]):
         """Initialize function call.
@@ -108,12 +109,12 @@ class SageMakerAIModel(OpenAIModel):
 
         max_tokens: int
         stream: bool
-        temperature: Optional[float]
-        top_p: Optional[float]
-        top_k: Optional[int]
-        stop: Optional[list[str]]
-        tool_results_as_user_messages: Optional[bool]
-        additional_args: Optional[dict[str, Any]]
+        temperature: float | None
+        top_p: float | None
+        top_k: int | None
+        stop: list[str] | None
+        tool_results_as_user_messages: bool | None
+        additional_args: dict[str, Any] | None
 
     class SageMakerAIEndpointConfig(TypedDict, total=False):
         """Configuration options for SageMaker models.
@@ -127,17 +128,17 @@ class SageMakerAIModel(OpenAIModel):
 
         endpoint_name: str
         region_name: str
-        inference_component_name: Union[str, None]
-        target_model: Union[Optional[str], None]
-        target_variant: Union[Optional[str], None]
-        additional_args: Optional[dict[str, Any]]
+        inference_component_name: str | None
+        target_model: str | None | None
+        target_variant: str | None | None
+        additional_args: dict[str, Any] | None
 
     def __init__(
         self,
         endpoint_config: SageMakerAIEndpointConfig,
         payload_config: SageMakerAIPayloadSchema,
-        boto_session: Optional[boto3.Session] = None,
-        boto_client_config: Optional[BotocoreConfig] = None,
+        boto_session: boto3.Session | None = None,
+        boto_client_config: BotocoreConfig | None = None,
     ):
         """Initialize provider instance.
 
@@ -151,8 +152,8 @@ class SageMakerAIModel(OpenAIModel):
         validate_config_keys(payload_config, self.SageMakerAIPayloadSchema)
         payload_config.setdefault("stream", True)
         payload_config.setdefault("tool_results_as_user_messages", False)
-        self.endpoint_config = dict(endpoint_config)
-        self.payload_config = dict(payload_config)
+        self.endpoint_config = self.SageMakerAIEndpointConfig(**endpoint_config)
+        self.payload_config = self.SageMakerAIPayloadSchema(**payload_config)
         logger.debug(
             "endpoint_config=<%s> payload_config=<%s> | initializing", self.endpoint_config, self.payload_config
         )
@@ -193,15 +194,16 @@ class SageMakerAIModel(OpenAIModel):
         Returns:
             The Amazon SageMaker model configuration.
         """
-        return cast(SageMakerAIModel.SageMakerAIEndpointConfig, self.endpoint_config)
+        return self.endpoint_config
 
     @override
     def format_request(
         self,
         messages: Messages,
-        tool_specs: Optional[list[ToolSpec]] = None,
-        system_prompt: Optional[str] = None,
+        tool_specs: list[ToolSpec] | None = None,
+        system_prompt: str | None = None,
         tool_choice: ToolChoice | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
         """Format an Amazon SageMaker chat streaming request.
 
@@ -211,6 +213,7 @@ class SageMakerAIModel(OpenAIModel):
             system_prompt: System prompt to provide context to the model.
             tool_choice: Selection strategy for tool invocation. **Note: This parameter is accepted for
                 interface consistency but is currently ignored for this model provider.**
+            **kwargs: Additional keyword arguments for future extensibility.
 
         Returns:
             An Amazon SageMaker chat streaming request.
@@ -237,6 +240,10 @@ class SageMakerAIModel(OpenAIModel):
                 if k not in ["additional_args", "tool_results_as_user_messages"]
             },
         }
+
+        payload_additional_args = self.payload_config.get("additional_args")
+        if payload_additional_args:
+            payload.update(payload_additional_args)
 
         # Remove tools and tool_choice if tools = []
         if not payload["tools"]:
@@ -273,16 +280,20 @@ class SageMakerAIModel(OpenAIModel):
         }
 
         # Add optional SageMaker parameters if provided
-        if self.endpoint_config.get("inference_component_name"):
-            request["InferenceComponentName"] = self.endpoint_config["inference_component_name"]
-        if self.endpoint_config.get("target_model"):
-            request["TargetModel"] = self.endpoint_config["target_model"]
-        if self.endpoint_config.get("target_variant"):
-            request["TargetVariant"] = self.endpoint_config["target_variant"]
+        inf_component_name = self.endpoint_config.get("inference_component_name")
+        if inf_component_name:
+            request["InferenceComponentName"] = inf_component_name
+        target_model = self.endpoint_config.get("target_model")
+        if target_model:
+            request["TargetModel"] = target_model
+        target_variant = self.endpoint_config.get("target_variant")
+        if target_variant:
+            request["TargetVariant"] = target_variant
 
-        # Add additional args if provided
-        if self.endpoint_config.get("additional_args"):
-            request.update(self.endpoint_config["additional_args"].__dict__)
+        # Add additional request args if provided
+        additional_args = self.endpoint_config.get("additional_args")
+        if additional_args:
+            request.update(additional_args)
 
         return request
 
@@ -290,8 +301,8 @@ class SageMakerAIModel(OpenAIModel):
     async def stream(
         self,
         messages: Messages,
-        tool_specs: Optional[list[ToolSpec]] = None,
-        system_prompt: Optional[str] = None,
+        tool_specs: list[ToolSpec] | None = None,
+        system_prompt: str | None = None,
         *,
         tool_choice: ToolChoice | None = None,
         **kwargs: Any,
@@ -343,7 +354,7 @@ class SageMakerAIModel(OpenAIModel):
                         logger.info("choice=<%s>", json.dumps(choice, indent=2))
 
                         # Handle text content
-                        if choice["delta"].get("content", None):
+                        if choice["delta"].get("content"):
                             if not text_content_started:
                                 yield self.format_chunk({"chunk_type": "content_start", "data_type": "text"})
                                 text_content_started = True
@@ -357,7 +368,7 @@ class SageMakerAIModel(OpenAIModel):
                             )
 
                         # Handle reasoning content
-                        if choice["delta"].get("reasoning_content", None):
+                        if choice["delta"].get("reasoning_content"):
                             if not reasoning_content_started:
                                 yield self.format_chunk(
                                     {"chunk_type": "content_start", "data_type": "reasoning_content"}
@@ -382,7 +393,7 @@ class SageMakerAIModel(OpenAIModel):
                             finish_reason = choice["finish_reason"]
                             break
 
-                        if choice.get("usage", None):
+                        if choice.get("usage"):
                             yield self.format_chunk(
                                 {"chunk_type": "metadata", "data": UsageMetadata(**choice["usage"])}
                             )
@@ -402,7 +413,7 @@ class SageMakerAIModel(OpenAIModel):
                 # Handle tool calling
                 logger.info("tool_calls=<%s>", json.dumps(tool_calls, indent=2))
                 for tool_deltas in tool_calls.values():
-                    if not tool_deltas[0]["function"].get("name", None):
+                    if not tool_deltas[0]["function"].get("name"):
                         raise Exception("The model did not provide a tool name.")
                     yield self.format_chunk(
                         {"chunk_type": "content_start", "data_type": "tool", "data": ToolCall(**tool_deltas[0])}
@@ -443,7 +454,7 @@ class SageMakerAIModel(OpenAIModel):
                     yield self.format_chunk({"chunk_type": "content_stop", "data_type": "text"})
 
                 # Handle reasoning content
-                if message.get("reasoning_content", None):
+                if message.get("reasoning_content"):
                     yield self.format_chunk({"chunk_type": "content_start", "data_type": "reasoning_content"})
                     yield self.format_chunk(
                         {
@@ -455,7 +466,7 @@ class SageMakerAIModel(OpenAIModel):
                     yield self.format_chunk({"chunk_type": "content_stop", "data_type": "reasoning_content"})
 
                 # Handle the tool calling, if any
-                if message.get("tool_calls", None) or message_stop_reason == "tool_calls":
+                if message.get("tool_calls") or message_stop_reason == "tool_calls":
                     if not isinstance(message["tool_calls"], list):
                         message["tool_calls"] = [message["tool_calls"]]
                     for tool_call in message["tool_calls"]:
@@ -474,9 +485,9 @@ class SageMakerAIModel(OpenAIModel):
                 # Message close
                 yield self.format_chunk({"chunk_type": "message_stop", "data": message_stop_reason})
                 # Handle usage metadata
-                if final_response_json.get("usage", None):
+                if final_response_json.get("usage"):
                     yield self.format_chunk(
-                        {"chunk_type": "metadata", "data": UsageMetadata(**final_response_json.get("usage", None))}
+                        {"chunk_type": "metadata", "data": UsageMetadata(**final_response_json.get("usage"))}
                     )
         except (
             self.client.exceptions.InternalFailure,
@@ -493,11 +504,12 @@ class SageMakerAIModel(OpenAIModel):
 
     @override
     @classmethod
-    def format_request_tool_message(cls, tool_result: ToolResult) -> dict[str, Any]:
+    def format_request_tool_message(cls, tool_result: ToolResult, **kwargs: Any) -> dict[str, Any]:
         """Format a SageMaker compatible tool message.
 
         Args:
             tool_result: Tool result collected from a tool execution.
+            **kwargs: Additional keyword arguments for future extensibility.
 
         Returns:
             SageMaker compatible tool message with content as a string.
@@ -523,11 +535,12 @@ class SageMakerAIModel(OpenAIModel):
 
     @override
     @classmethod
-    def format_request_message_content(cls, content: ContentBlock) -> dict[str, Any]:
+    def format_request_message_content(cls, content: ContentBlock, **kwargs: Any) -> dict[str, Any]:
         """Format a content block.
 
         Args:
             content: Message content.
+            **kwargs: Additional keyword arguments for future extensibility.
 
         Returns:
             Formatted content block.
@@ -544,7 +557,7 @@ class SageMakerAIModel(OpenAIModel):
                 "thinking": content["reasoningContent"].get("reasoningText", {}).get("text", ""),
                 "type": "thinking",
             }
-        elif not content.get("reasoningContent", None):
+        elif not content.get("reasoningContent"):
             content.pop("reasoningContent", None)
 
         if "video" in content:
@@ -560,8 +573,8 @@ class SageMakerAIModel(OpenAIModel):
 
     @override
     async def structured_output(
-        self, output_model: Type[T], prompt: Messages, system_prompt: Optional[str] = None, **kwargs: Any
-    ) -> AsyncGenerator[dict[str, Union[T, Any]], None]:
+        self, output_model: type[T], prompt: Messages, system_prompt: str | None = None, **kwargs: Any
+    ) -> AsyncGenerator[dict[str, T | Any], None]:
         """Get structured output from the model.
 
         Args:

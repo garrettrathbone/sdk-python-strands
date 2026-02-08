@@ -44,25 +44,27 @@ import asyncio
 import functools
 import inspect
 import logging
+from collections.abc import Callable
 from typing import (
+    Annotated,
     Any,
-    Callable,
     Generic,
-    Optional,
     ParamSpec,
-    Type,
     TypeVar,
-    Union,
     cast,
+    get_args,
+    get_origin,
     get_type_hints,
     overload,
 )
 
 import docstring_parser
 from pydantic import BaseModel, Field, create_model
+from pydantic.fields import FieldInfo
 from typing_extensions import override
 
-from ..types._events import ToolResultEvent, ToolStreamEvent
+from ..interrupt import InterruptException
+from ..types._events import ToolInterruptEvent, ToolResultEvent, ToolStreamEvent
 from ..types.tools import AgentTool, JSONSchema, ToolContext, ToolGenerator, ToolResult, ToolSpec, ToolUse
 
 logger = logging.getLogger(__name__)
@@ -96,22 +98,89 @@ class FunctionToolMetadata:
         """
         self.func = func
         self.signature = inspect.signature(func)
-        self.type_hints = get_type_hints(func)
+        self.type_hints = get_type_hints(func, include_extras=True)
         self._context_param = context_param
+
+        self._validate_signature()
 
         # Parse the docstring with docstring_parser
         doc_str = inspect.getdoc(func) or ""
         self.doc = docstring_parser.parse(doc_str)
-
-        # Get parameter descriptions from parsed docstring
-        self.param_descriptions = {
+        self.param_descriptions: dict[str, str] = {
             param.arg_name: param.description or f"Parameter {param.arg_name}" for param in self.doc.params
         }
 
         # Create a Pydantic model for validation
         self.input_model = self._create_input_model()
 
-    def _create_input_model(self) -> Type[BaseModel]:
+    def _extract_annotated_metadata(
+        self, annotation: Any, param_name: str, param_default: Any
+    ) -> tuple[Any, FieldInfo]:
+        """Extracts type and a simple string description from an Annotated type hint.
+
+        Returns:
+            A tuple of (actual_type, field_info), where field_info is a new, simple
+            Pydantic FieldInfo instance created from the extracted metadata.
+        """
+        actual_type = annotation
+        description: str | None = None
+
+        if get_origin(annotation) is Annotated:
+            args = get_args(annotation)
+            actual_type = args[0]
+
+            # Look through metadata for a string description or a FieldInfo object
+            for meta in args[1:]:
+                if isinstance(meta, str):
+                    description = meta
+                elif isinstance(meta, FieldInfo):
+                    # --- Future Contributor Note ---
+                    # We are explicitly blocking the use of `pydantic.Field` within `Annotated`
+                    # because of the complexities of Pydantic v2's immutable Core Schema.
+                    #
+                    # Once a Pydantic model's schema is built, its `FieldInfo` objects are
+                    # effectively frozen. Attempts to mutate a `FieldInfo` object after
+                    # creation (e.g., by copying it and setting `.description` or `.default`)
+                    # are unreliable because the underlying Core Schema does not see these changes.
+                    #
+                    # The correct way to support this would be to reliably extract all
+                    # constraints (ge, le, pattern, etc.) from the original FieldInfo and
+                    # rebuild a new one from scratch. However, these constraints are not
+                    # stored as public attributes, making them difficult to inspect reliably.
+                    #
+                    # Deferring this complexity until there is clear demand and a robust
+                    # pattern for inspecting FieldInfo constraints is established.
+                    raise NotImplementedError(
+                        "Using pydantic.Field within Annotated is not yet supported for tool decorators. "
+                        "Please use a simple string for the description, or define constraints in the function's "
+                        "docstring."
+                    )
+
+        # Determine the final description with a clear priority order
+        # Priority: 1. Annotated string -> 2. Docstring -> 3. Fallback
+        final_description = description
+        if final_description is None:
+            final_description = self.param_descriptions.get(param_name) or f"Parameter {param_name}"
+        # Create FieldInfo object from scratch
+        final_field = Field(default=param_default, description=final_description)
+
+        return actual_type, final_field
+
+    def _validate_signature(self) -> None:
+        """Verify that ToolContext is used correctly in the function signature."""
+        for param in self.signature.parameters.values():
+            if param.annotation is ToolContext:
+                if self._context_param is None:
+                    raise ValueError("@tool(context) must be set if passing in ToolContext param")
+
+                if param.name != self._context_param:
+                    raise ValueError(
+                        f"param_name=<{param.name}> | ToolContext param must be named '{self._context_param}'"
+                    )
+                # Found the parameter, no need to check further
+                break
+
+    def _create_input_model(self) -> type[BaseModel]:
         """Create a Pydantic model from function signature for input validation.
 
         This method analyzes the function's signature, type hints, and docstring to create a Pydantic model that can
@@ -129,23 +198,80 @@ class FunctionToolMetadata:
             if self._is_special_parameter(name):
                 continue
 
-            # Get parameter type and default
-            param_type = self.type_hints.get(name, Any)
+            # Handle PEP 563 (from __future__ import annotations):
+            # - When PEP 563 is active, param.annotation is a string literal that needs resolution
+            # - When PEP 563 is not active, param.annotation is the actual type object (may include Annotated)
+            # We check if param.annotation is a string to determine if we need type hint resolution.
+            # This preserves Annotated metadata correctly in both cases and is consistent across Python versions.
+            if isinstance(param.annotation, str):
+                # PEP 563 active: resolve string annotation
+                param_type = self.type_hints.get(name, param.annotation)
+            else:
+                # PEP 563 not active: use the actual type object directly
+                param_type = param.annotation
+            if param_type is inspect.Parameter.empty:
+                param_type = Any
             default = ... if param.default is inspect.Parameter.empty else param.default
-            description = self.param_descriptions.get(name, f"Parameter {name}")
 
-            # Create Field with description and default
-            field_definitions[name] = (param_type, Field(default=default, description=description))
+            actual_type, field_info = self._extract_annotated_metadata(param_type, name, default)
+            field_definitions[name] = (actual_type, field_info)
 
-        # Create model name based on function name
         model_name = f"{self.func.__name__.capitalize()}Tool"
 
-        # Create and return the model
         if field_definitions:
             return create_model(model_name, **field_definitions)
         else:
-            # Handle case with no parameters
             return create_model(model_name)
+
+    def _extract_description_from_docstring(self) -> str:
+        """Extract the docstring excluding only the Args section.
+
+        This method uses the parsed docstring to extract everything except
+        the Args/Arguments/Parameters section, preserving Returns, Raises,
+        Examples, and other sections.
+
+        Returns:
+            The description text, or the function name if no description is available.
+        """
+        func_name = self.func.__name__
+
+        # Fallback: try to extract manually from raw docstring
+        raw_docstring = inspect.getdoc(self.func)
+        if raw_docstring:
+            lines = raw_docstring.strip().split("\n")
+            result_lines = []
+            skip_args_section = False
+
+            for line in lines:
+                stripped_line = line.strip()
+
+                # Check if we're starting the Args section
+                if stripped_line.lower().startswith(("args:", "arguments:", "parameters:", "param:", "params:")):
+                    skip_args_section = True
+                    continue
+
+                # Check if we're starting a new section (not Args)
+                elif (
+                    stripped_line.lower().startswith(("returns:", "return:", "yields:", "yield:"))
+                    or stripped_line.lower().startswith(("raises:", "raise:", "except:", "exceptions:"))
+                    or stripped_line.lower().startswith(("examples:", "example:", "note:", "notes:"))
+                    or stripped_line.lower().startswith(("see also:", "seealso:", "references:", "ref:"))
+                ):
+                    skip_args_section = False
+                    result_lines.append(line)
+                    continue
+
+                # If we're not in the Args section, include the line
+                if not skip_args_section:
+                    result_lines.append(line)
+
+            # Join and clean up the description
+            description = "\n".join(result_lines).strip()
+            if description:
+                return description
+
+        # Final fallback: use function name
+        return func_name
 
     def extract_metadata(self) -> ToolSpec:
         """Extract metadata from the function to create a tool specification.
@@ -156,7 +282,7 @@ class FunctionToolMetadata:
         The specification includes:
 
         - name: The function name (or custom override)
-        - description: The function's docstring
+        - description: The function's docstring description (excluding Args)
         - inputSchema: A JSON schema describing the expected parameters
 
         Returns:
@@ -164,12 +290,8 @@ class FunctionToolMetadata:
         """
         func_name = self.func.__name__
 
-        # Extract function description from docstring, preserving paragraph breaks
-        description = inspect.getdoc(self.func)
-        if description:
-            description = description.strip()
-        else:
-            description = func_name
+        # Extract function description from parsed docstring, excluding Args section and beyond
+        description = self._extract_description_from_docstring()
 
         # Get schema directly from the Pydantic model
         input_schema = self.input_model.model_json_schema()
@@ -204,13 +326,20 @@ class FunctionToolMetadata:
                 del schema[key]
 
         # Process properties to clean up anyOf and similar structures
+        required_fields = schema.get("required", [])
         if "properties" in schema:
-            for _prop_name, prop_schema in schema["properties"].items():
+            for prop_name, prop_schema in schema["properties"].items():
                 # Handle anyOf constructs (common for Optional types)
                 if "anyOf" in prop_schema:
                     any_of = prop_schema["anyOf"]
                     # Handle Optional[Type] case (represented as anyOf[Type, null])
-                    if len(any_of) == 2 and any(item.get("type") == "null" for item in any_of):
+                    # Only simplify when the field is not required; required nullable
+                    # fields need anyOf preserved so the model can pass null.
+                    if (
+                        prop_name not in required_fields
+                        and len(any_of) == 2
+                        and any(item.get("type") == "null" for item in any_of)
+                    ):
                         # Find the non-null type
                         for item in any_of:
                             if item.get("type") != "null":
@@ -346,7 +475,7 @@ class DecoratedFunctionTool(AgentTool, Generic[P, R]):
 
         functools.update_wrapper(wrapper=self, wrapped=self._tool_func)
 
-    def __get__(self, instance: Any, obj_type: Optional[Type] = None) -> "DecoratedFunctionTool[P, R]":
+    def __get__(self, instance: Any, obj_type: type | None = None) -> "DecoratedFunctionTool[P, R]":
         """Descriptor protocol implementation for proper method binding.
 
         This method enables the decorated function to work correctly when used as a class method.
@@ -477,6 +606,10 @@ class DecoratedFunctionTool(AgentTool, Generic[P, R]):
                 result = await asyncio.to_thread(self._tool_func, **validated_input)  # type: ignore
                 yield self._wrap_tool_result(tool_use_id, result)
 
+        except InterruptException as e:
+            yield ToolInterruptEvent(tool_use, [e.interrupt])
+            return
+
         except ValueError as e:
             # Special handling for validation errors
             error_msg = str(e)
@@ -545,20 +678,20 @@ def tool(__func: Callable[P, R]) -> DecoratedFunctionTool[P, R]: ...
 # Handle @decorator()
 @overload
 def tool(
-    description: Optional[str] = None,
-    inputSchema: Optional[JSONSchema] = None,
-    name: Optional[str] = None,
+    description: str | None = None,
+    inputSchema: JSONSchema | None = None,
+    name: str | None = None,
     context: bool | str = False,
 ) -> Callable[[Callable[P, R]], DecoratedFunctionTool[P, R]]: ...
 # Suppressing the type error because we want callers to be able to use both `tool` and `tool()` at the
 # call site, but the actual implementation handles that and it's not representable via the type-system
 def tool(  # type: ignore
-    func: Optional[Callable[P, R]] = None,
-    description: Optional[str] = None,
-    inputSchema: Optional[JSONSchema] = None,
-    name: Optional[str] = None,
+    func: Callable[P, R] | None = None,
+    description: str | None = None,
+    inputSchema: JSONSchema | None = None,
+    name: str | None = None,
     context: bool | str = False,
-) -> Union[DecoratedFunctionTool[P, R], Callable[[Callable[P, R]], DecoratedFunctionTool[P, R]]]:
+) -> DecoratedFunctionTool[P, R] | Callable[[Callable[P, R]], DecoratedFunctionTool[P, R]]:
     """Decorator that transforms a Python function into a Strands tool.
 
     This decorator seamlessly enables a function to be called both as a regular Python function and as a Strands tool.
