@@ -32,14 +32,20 @@ type-safe system that supports multiple subscribers per event type.
 from .events import (
     AfterInvocationEvent,
     AfterModelCallEvent,
+    # Multiagent hook events
+    AfterMultiAgentInvocationEvent,
+    AfterNodeCallEvent,
     AfterToolCallEvent,
     AgentInitializedEvent,
     BeforeInvocationEvent,
     BeforeModelCallEvent,
+    BeforeMultiAgentInvocationEvent,
+    BeforeNodeCallEvent,
     BeforeToolCallEvent,
     MessageAddedEvent,
     SubAgentAddedEvent,
     SubAgentRemovedEvent,
+    MultiAgentInitializedEvent,
 )
 from .registry import BaseHookEvent, HookCallback, HookEvent, HookProvider, HookRegistry
 
@@ -60,4 +66,9 @@ __all__ = [
     "HookRegistry",
     "HookEvent",
     "BaseHookEvent",
+    "AfterMultiAgentInvocationEvent",
+    "AfterNodeCallEvent",
+    "BeforeMultiAgentInvocationEvent",
+    "BeforeNodeCallEvent",
+    "MultiAgentInitializedEvent",
 ]

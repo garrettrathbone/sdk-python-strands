@@ -1,12 +1,25 @@
+import base64
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from mcp import ListToolsResult
 from mcp.types import CallToolResult as MCPCallToolResult
-from mcp.types import GetPromptResult, ListPromptsResult, Prompt, PromptMessage
+from mcp.types import (
+    GetPromptResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListResourceTemplatesResult,
+    Prompt,
+    PromptMessage,
+    ReadResourceResult,
+    Resource,
+    ResourceTemplate,
+    TextResourceContents,
+)
 from mcp.types import TextContent as MCPTextContent
 from mcp.types import Tool as MCPTool
+from pydantic import AnyUrl
 
 from strands.tools.mcp import MCPClient
 from strands.tools.mcp.mcp_types import MCPToolResult
@@ -523,6 +536,33 @@ def test_stop_with_background_thread_but_no_event_loop():
     assert client._background_thread is None
 
 
+def test_stop_closes_event_loop():
+    """Test that stop() properly closes the event loop when it exists."""
+    client = MCPClient(MagicMock())
+
+    # Mock a background thread with event loop
+    mock_thread = MagicMock()
+    mock_thread.join = MagicMock()
+    mock_event_loop = MagicMock()
+    mock_event_loop.close = MagicMock()
+
+    client._background_thread = mock_thread
+    client._background_thread_event_loop = mock_event_loop
+
+    # Should close the event loop and join the thread
+    client.stop(None, None, None)
+
+    # Verify thread was joined
+    mock_thread.join.assert_called_once()
+
+    # Verify event loop was closed
+    mock_event_loop.close.assert_called_once()
+
+    # Verify cleanup occurred
+    assert client._background_thread is None
+    assert client._background_thread_event_loop is None
+
+
 def test_mcp_client_state_reset_after_timeout():
     """Test that all client state is properly reset after timeout."""
 
@@ -541,3 +581,364 @@ def test_mcp_client_state_reset_after_timeout():
     assert client._background_thread_session is None
     assert client._background_thread_event_loop is None
     assert not client._init_future.done()  # New future created
+
+
+def test_call_tool_sync_embedded_nested_text(mock_transport, mock_session):
+    """EmbeddedResource.resource (uri + text) should map to plain text content."""
+    embedded_resource = {
+        "type": "resource",  # required literal
+        "resource": {
+            "uri": "mcp://resource/embedded-text-1",
+            "text": "inner text",
+            "mimeType": "text/plain",
+        },
+    }
+    mock_session.call_tool.return_value = MCPCallToolResult(isError=False, content=[embedded_resource])
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.call_tool_sync(tool_use_id="er-text", name="get_file_contents", arguments={})
+
+        mock_session.call_tool.assert_called_once_with("get_file_contents", {}, None)
+        assert result["status"] == "success"
+        assert len(result["content"]) == 1
+        assert result["content"][0]["text"] == "inner text"
+
+
+def test_call_tool_sync_embedded_nested_base64_textual_mime(mock_transport, mock_session):
+    """EmbeddedResource.resource (uri + blob with textual MIME) should decode to text."""
+
+    payload = base64.b64encode(b'{"k":"v"}').decode()
+
+    embedded_resource = {
+        "type": "resource",
+        "resource": {
+            "uri": "mcp://resource/embedded-blob-1",
+            # NOTE: blob is a STRING, mimeType is sibling
+            "blob": payload,
+            "mimeType": "application/json",
+        },
+    }
+    mock_session.call_tool.return_value = MCPCallToolResult(isError=False, content=[embedded_resource])
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.call_tool_sync(tool_use_id="er-blob", name="get_file_contents", arguments={})
+
+        mock_session.call_tool.assert_called_once_with("get_file_contents", {}, None)
+        assert result["status"] == "success"
+        assert len(result["content"]) == 1
+        assert result["content"][0]["text"] == '{"k":"v"}'
+
+
+def test_call_tool_sync_embedded_image_blob(mock_transport, mock_session):
+    """EmbeddedResource.resource (blob with image MIME) should map to image content."""
+    # Read yellow.png file
+    with open("tests_integ/resources/yellow.png", "rb") as image_file:
+        png_data = image_file.read()
+    payload = base64.b64encode(png_data).decode()
+
+    embedded_resource = {
+        "type": "resource",
+        "resource": {
+            "uri": "mcp://resource/embedded-image",
+            "blob": payload,
+            "mimeType": "image/png",
+        },
+    }
+    mock_session.call_tool.return_value = MCPCallToolResult(isError=False, content=[embedded_resource])
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.call_tool_sync(tool_use_id="er-image", name="get_file_contents", arguments={})
+
+        mock_session.call_tool.assert_called_once_with("get_file_contents", {}, None)
+        assert result["status"] == "success"
+        assert len(result["content"]) == 1
+        assert "image" in result["content"][0]
+        assert result["content"][0]["image"]["format"] == "png"
+        assert "bytes" in result["content"][0]["image"]["source"]
+
+
+def test_call_tool_sync_embedded_non_textual_blob_dropped(mock_transport, mock_session):
+    """EmbeddedResource.resource (blob with non-textual/unknown MIME) should be dropped."""
+    payload = base64.b64encode(b"\x00\x01\x02\x03").decode()
+
+    embedded_resource = {
+        "type": "resource",
+        "resource": {
+            "uri": "mcp://resource/embedded-binary",
+            "blob": payload,
+            "mimeType": "application/octet-stream",
+        },
+    }
+    mock_session.call_tool.return_value = MCPCallToolResult(isError=False, content=[embedded_resource])
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.call_tool_sync(tool_use_id="er-binary", name="get_file_contents", arguments={})
+
+        mock_session.call_tool.assert_called_once_with("get_file_contents", {}, None)
+        assert result["status"] == "success"
+        assert len(result["content"]) == 0  # Content should be dropped
+
+
+def test_call_tool_sync_embedded_multiple_textual_mimes(mock_transport, mock_session):
+    """EmbeddedResource with different textual MIME types should decode to text."""
+
+    # Test YAML content
+    yaml_content = base64.b64encode(b"key: value\nlist:\n  - item1\n  - item2").decode()
+    embedded_resource = {
+        "type": "resource",
+        "resource": {
+            "uri": "mcp://resource/embedded-yaml",
+            "blob": yaml_content,
+            "mimeType": "application/yaml",
+        },
+    }
+    mock_session.call_tool.return_value = MCPCallToolResult(isError=False, content=[embedded_resource])
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.call_tool_sync(tool_use_id="er-yaml", name="get_file_contents", arguments={})
+
+        mock_session.call_tool.assert_called_once_with("get_file_contents", {}, None)
+        assert result["status"] == "success"
+        assert len(result["content"]) == 1
+        assert "key: value" in result["content"][0]["text"]
+
+
+def test_call_tool_sync_embedded_unknown_resource_type_dropped(mock_transport, mock_session):
+    """EmbeddedResource with unknown resource type should be dropped for forward compatibility."""
+
+    # Mock an unknown resource type that's neither TextResourceContents nor BlobResourceContents
+    class UnknownResourceContents:
+        def __init__(self):
+            self.uri = "mcp://resource/unknown-type"
+            self.mimeType = "application/unknown"
+            self.data = "some unknown data"
+
+    # Create a mock embedded resource with unknown resource type
+    mock_embedded_resource = MagicMock()
+    mock_embedded_resource.resource = UnknownResourceContents()
+
+    mock_session.call_tool.return_value = MagicMock(
+        isError=False, content=[mock_embedded_resource], structuredContent=None
+    )
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.call_tool_sync(tool_use_id="er-unknown", name="get_file_contents", arguments={})
+
+        mock_session.call_tool.assert_called_once_with("get_file_contents", {}, None)
+        assert result["status"] == "success"
+        assert len(result["content"]) == 0  # Unknown resource type should be dropped
+
+
+@pytest.mark.asyncio
+async def test_handle_error_message_non_fatal_error():
+    """Test that _handle_error_message ignores non-fatal errors and logs them."""
+    client = MCPClient(MagicMock())
+
+    # Test the message handler directly with a non-fatal error
+    with patch.object(client, "_log_debug_with_thread") as mock_log:
+        # This should not raise an exception
+        await client._handle_error_message(Exception("unknown request id: abc123"))
+
+        # Verify the non-fatal error was logged as ignored
+        assert mock_log.called
+        call_args = mock_log.call_args[0]
+        assert "ignoring non-fatal MCP session error" in call_args[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_error_message_fatal_error():
+    """Test that _handle_error_message raises fatal errors."""
+    client = MCPClient(MagicMock())
+
+    # This should raise the exception
+    with pytest.raises(Exception, match="connection timeout"):
+        await client._handle_error_message(Exception("connection timeout"))
+
+
+@pytest.mark.asyncio
+async def test_handle_error_message_non_exception():
+    """Test that _handle_error_message handles non-exception messages."""
+    client = MCPClient(MagicMock())
+
+    # This should not raise an exception
+    await client._handle_error_message("normal message")
+
+
+def test_call_tool_sync_with_meta_and_structured_content(mock_transport, mock_session):
+    """Test that call_tool_sync correctly handles both meta and structuredContent fields."""
+    mock_content = MCPTextContent(type="text", text="Test message")
+    metadata = {"tokenUsage": {"inputTokens": 100, "outputTokens": 50}}
+    structured_content = {"result": 42, "status": "completed"}
+    mock_session.call_tool.return_value = MCPCallToolResult(
+        isError=False, content=[mock_content], _meta=metadata, structuredContent=structured_content
+    )
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.call_tool_sync(tool_use_id="test-123", name="test_tool", arguments={"param": "value"})
+
+        mock_session.call_tool.assert_called_once_with("test_tool", {"param": "value"}, None)
+
+        assert result["status"] == "success"
+        assert result["toolUseId"] == "test-123"
+        assert "metadata" in result
+        assert result["metadata"] == metadata
+        assert "structuredContent" in result
+        assert result["structuredContent"] == structured_content
+
+
+# Resource Tests - Sync Methods
+
+
+def test_list_resources_sync(mock_transport, mock_session):
+    """Test that list_resources_sync correctly retrieves resources."""
+    mock_resource = Resource(
+        uri=AnyUrl("file://documents/test.txt"), name="test.txt", description="A test document", mimeType="text/plain"
+    )
+    mock_session.list_resources.return_value = ListResourcesResult(resources=[mock_resource])
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.list_resources_sync()
+
+        mock_session.list_resources.assert_called_once_with(cursor=None)
+        assert len(result.resources) == 1
+        assert result.resources[0].name == "test.txt"
+        assert str(result.resources[0].uri) == "file://documents/test.txt"
+        assert result.nextCursor is None
+
+
+def test_list_resources_sync_with_pagination_token(mock_transport, mock_session):
+    """Test that list_resources_sync correctly passes pagination token and returns next cursor."""
+    mock_resource = Resource(
+        uri=AnyUrl("file://documents/test.txt"), name="test.txt", description="A test document", mimeType="text/plain"
+    )
+    mock_session.list_resources.return_value = ListResourcesResult(resources=[mock_resource], nextCursor="next_page")
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.list_resources_sync(pagination_token="current_page")
+
+        mock_session.list_resources.assert_called_once_with(cursor="current_page")
+        assert len(result.resources) == 1
+        assert result.resources[0].name == "test.txt"
+        assert result.nextCursor == "next_page"
+
+
+def test_list_resources_sync_session_not_active():
+    """Test that list_resources_sync raises an error when session is not active."""
+    client = MCPClient(MagicMock())
+
+    with pytest.raises(MCPClientInitializationError, match="client session is not running"):
+        client.list_resources_sync()
+
+
+def test_read_resource_sync(mock_transport, mock_session):
+    """Test that read_resource_sync correctly reads a resource."""
+    mock_content = TextResourceContents(
+        uri=AnyUrl("file://documents/test.txt"), text="Resource content", mimeType="text/plain"
+    )
+    mock_session.read_resource.return_value = ReadResourceResult(contents=[mock_content])
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.read_resource_sync("file://documents/test.txt")
+
+        # Verify the session method was called
+        mock_session.read_resource.assert_called_once()
+        # Check the URI argument (it will be wrapped as AnyUrl)
+        call_args = mock_session.read_resource.call_args[0]
+        assert str(call_args[0]) == "file://documents/test.txt"
+
+        assert len(result.contents) == 1
+        assert result.contents[0].text == "Resource content"
+
+
+def test_read_resource_sync_with_anyurl(mock_transport, mock_session):
+    """Test that read_resource_sync correctly handles AnyUrl input."""
+    mock_content = TextResourceContents(
+        uri=AnyUrl("file://documents/test.txt"), text="Resource content", mimeType="text/plain"
+    )
+    mock_session.read_resource.return_value = ReadResourceResult(contents=[mock_content])
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        uri = AnyUrl("file://documents/test.txt")
+        result = client.read_resource_sync(uri)
+
+        mock_session.read_resource.assert_called_once()
+        call_args = mock_session.read_resource.call_args[0]
+        assert str(call_args[0]) == "file://documents/test.txt"
+
+        assert len(result.contents) == 1
+        assert result.contents[0].text == "Resource content"
+
+
+def test_read_resource_sync_session_not_active():
+    """Test that read_resource_sync raises an error when session is not active."""
+    client = MCPClient(MagicMock())
+
+    with pytest.raises(MCPClientInitializationError, match="client session is not running"):
+        client.read_resource_sync("file://documents/test.txt")
+
+
+def test_list_resource_templates_sync(mock_transport, mock_session):
+    """Test that list_resource_templates_sync correctly retrieves resource templates."""
+    mock_template = ResourceTemplate(
+        uriTemplate="file://documents/{name}",
+        name="document_template",
+        description="Template for documents",
+        mimeType="text/plain",
+    )
+    mock_session.list_resource_templates.return_value = ListResourceTemplatesResult(resourceTemplates=[mock_template])
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.list_resource_templates_sync()
+
+        mock_session.list_resource_templates.assert_called_once_with(cursor=None)
+        assert len(result.resourceTemplates) == 1
+        assert result.resourceTemplates[0].name == "document_template"
+        assert result.resourceTemplates[0].uriTemplate == "file://documents/{name}"
+        assert result.nextCursor is None
+
+
+def test_list_resource_templates_sync_with_pagination_token(mock_transport, mock_session):
+    """Test that list_resource_templates_sync correctly passes pagination token and returns next cursor."""
+    mock_template = ResourceTemplate(
+        uriTemplate="file://documents/{name}",
+        name="document_template",
+        description="Template for documents",
+        mimeType="text/plain",
+    )
+    mock_session.list_resource_templates.return_value = ListResourceTemplatesResult(
+        resourceTemplates=[mock_template], nextCursor="next_page"
+    )
+
+    with MCPClient(mock_transport["transport_callable"]) as client:
+        result = client.list_resource_templates_sync(pagination_token="current_page")
+
+        mock_session.list_resource_templates.assert_called_once_with(cursor="current_page")
+        assert len(result.resourceTemplates) == 1
+        assert result.resourceTemplates[0].name == "document_template"
+        assert result.nextCursor == "next_page"
+
+
+def test_list_resource_templates_sync_session_not_active():
+    """Test that list_resource_templates_sync raises an error when session is not active."""
+    client = MCPClient(MagicMock())
+
+    with pytest.raises(MCPClientInitializationError, match="client session is not running"):
+        client.list_resource_templates_sync()
+
+
+@pytest.mark.asyncio
+async def test_handle_error_message_with_percent_in_message():
+    """Test that _handle_error_message handles messages containing % characters without string formatting errors.
+
+    This is a regression test for issue #1244 where MCP error messages containing '%' characters
+    (e.g., from URLs like "https://example.com/path?param=value%20encoded") would cause a
+    TypeError: not all arguments converted during string formatting.
+    """
+    client = MCPClient(MagicMock())
+
+    # Test with a message that contains % characters (like URL-encoded strings)
+    # This simulates the error that occurs when MCP servers return messages with % in them
+    error_with_percent = Exception("unknown request id: abc%20123%30def")
+
+    # This should not raise TypeError and should not raise the exception (since it's non-fatal)
+    await client._handle_error_message(error_with_percent)

@@ -121,3 +121,31 @@ class AgentDelegationException(Exception):
         self.transfer_state = transfer_state
         self.transfer_messages = transfer_messages
         super().__init__(f"Delegating to agent: {target_agent}")
+class ToolProviderException(Exception):
+    """Exception raised when a tool provider fails to load or cleanup tools."""
+
+    pass
+
+
+class StructuredOutputException(Exception):
+    """Exception raised when structured output validation fails after maximum retry attempts."""
+
+    def __init__(self, message: str):
+        """Initialize the exception with details about the failure.
+
+        Args:
+            message: The error message describing the structured output failure
+        """
+        self.message = message
+        super().__init__(message)
+
+
+class ConcurrencyException(Exception):
+    """Exception raised when concurrent invocations are attempted on an agent instance.
+
+    Agent instances maintain internal state that cannot be safely accessed concurrently.
+    This exception is raised when an invocation is attempted while another invocation
+    is already in progress on the same agent instance.
+    """
+
+    pass
